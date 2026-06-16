@@ -6,6 +6,10 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/gcm.h>
+
+#include <cstring>
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
@@ -15,43 +19,94 @@
 #include "network/HttpDownloader.h"
 
 namespace {
-// Config lives on the SD card (NOT baked into firmware) so the public OTA build
-// carries no secret and the token/endpoint can change without reflashing:
-//   /fridge.conf  ->  {"endpoint":"https://raw.../endpoint.json","token":"..."}
+// Fixed HTTPS URL of the encrypted dashboard (a GitHub Release asset, updated in
+// place with `gh release upload --clobber`). Always available; no LAN server.
+constexpr char kEncUrl[] =
+    "https://github.com/hojinyoo/fridge-dashboard/releases/download/dashboard/dashboard.enc";
+// AES-256 key lives ONLY here on the SD (and on the Mac) — never on GitHub:
+//   /fridge.conf -> {"key":"<base64 of 32 bytes>"}
 constexpr char kConfigPath[] = "/fridge.conf";
-// Default pointer if /fridge.conf is missing (carries only a LAN address).
-constexpr char kDefaultEndpoint[] =
-    "https://raw.githubusercontent.com/hojinyoo/fridge-dashboard/HEAD/endpoint.json";
+constexpr char kEncPath[] = "/sleep.enc";   // downloaded ciphertext
+constexpr char kTmpPath[] = "/sleep.tmp";   // decrypt target (renamed on success)
 constexpr char kSleepBmpPath[] = "/sleep.bmp";
 constexpr char kLogPath[] = "/fridge.log";
+constexpr size_t kNonceLen = 12;
+constexpr size_t kTagLen = 16;
+constexpr size_t kChunk = 4096;
 
-struct SyncConfig {
-  std::string endpoint = kDefaultEndpoint;
-  std::string token;
-};
+// AES-256-GCM file format produced by encrypt_and_publish.py:
+//   [ 12-byte nonce | ciphertext | 16-byte tag ]
 
-SyncConfig loadConfig() {
-  SyncConfig c;
-  if (Storage.exists(kConfigPath)) {
-    String j = Storage.readFile(kConfigPath);
-    JsonDocument d;
-    if (!deserializeJson(d, j.c_str())) {
-      const char* ep = d["endpoint"] | "";
-      const char* tk = d["token"] | "";
-      if (ep[0] != '\0') c.endpoint = ep;
-      c.token = tk;
-    }
-  }
-  return c;
+bool loadKey(uint8_t out[32]) {
+  if (!Storage.exists(kConfigPath)) return false;
+  String j = Storage.readFile(kConfigPath);
+  JsonDocument d;
+  if (deserializeJson(d, j.c_str())) return false;
+  const char* kb64 = d["key"] | "";
+  if (kb64[0] == '\0') return false;
+  size_t olen = 0;
+  int rc = mbedtls_base64_decode(out, 32, &olen, reinterpret_cast<const unsigned char*>(kb64), strlen(kb64));
+  return rc == 0 && olen == 32;
 }
 
-std::string withToken(const std::string& url, const std::string& token) {
-  if (token.empty()) return url;
-  std::string out = url;
-  out += (url.find('?') == std::string::npos) ? "?" : "&";
-  out += "token=";
-  out += token;
-  return out;
+// Streaming GCM decrypt of /sleep.enc -> /sleep.tmp, then rename to /sleep.bmp
+// only if the auth tag verifies. Never holds the whole image in RAM.
+bool decryptEncToBmp(const uint8_t key[32], const char** err) {
+  static uint8_t inbuf[kChunk];
+  static uint8_t outbuf[kChunk];
+
+  HalFile in;
+  if (!Storage.openFileForRead("FRIDGE", kEncPath, in)) { *err = "open enc"; return false; }
+  const size_t total = in.fileSize();
+  if (total < kNonceLen + kTagLen) { *err = "enc too small"; in.close(); return false; }
+  const size_t ctLen = total - kNonceLen - kTagLen;
+
+  uint8_t nonce[kNonceLen];
+  uint8_t tag[kTagLen];
+  bool ok = in.read(nonce, kNonceLen) == static_cast<int>(kNonceLen) &&
+            in.seek(total - kTagLen) && in.read(tag, kTagLen) == static_cast<int>(kTagLen) &&
+            in.seek(kNonceLen);
+  if (!ok) { *err = "read header"; in.close(); return false; }
+
+  HalFile out;
+  if (!Storage.openFileForWrite("FRIDGE", kTmpPath, out)) { *err = "open tmp"; in.close(); return false; }
+
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  bool failed = false;
+  if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256) != 0) { *err = "setkey"; failed = true; }
+  if (!failed && mbedtls_gcm_starts(&gcm, MBEDTLS_GCM_DECRYPT, nonce, kNonceLen) != 0) { *err = "starts"; failed = true; }
+
+  size_t remaining = ctLen;
+  while (!failed && remaining > 0) {
+    const size_t want = remaining < kChunk ? remaining : kChunk;
+    const int n = in.read(inbuf, want);
+    if (n <= 0) { *err = "read ct"; failed = true; break; }
+    size_t olen = 0;
+    if (mbedtls_gcm_update(&gcm, inbuf, n, outbuf, sizeof(outbuf), &olen) != 0) { *err = "gcm update"; failed = true; break; }
+    if (olen && out.write(outbuf, olen) != olen) { *err = "write"; failed = true; break; }
+    remaining -= n;
+  }
+
+  uint8_t computed[kTagLen];
+  if (!failed) {
+    size_t flen = 0;
+    if (mbedtls_gcm_finish(&gcm, outbuf, sizeof(outbuf), &flen, computed, kTagLen) != 0) { *err = "finish"; failed = true; }
+    else if (flen && out.write(outbuf, flen) != flen) { *err = "write fin"; failed = true; }
+  }
+  mbedtls_gcm_free(&gcm);
+  in.close();
+  out.close();
+
+  if (failed) { Storage.remove(kTmpPath); return false; }
+
+  uint8_t diff = 0;
+  for (size_t i = 0; i < kTagLen; i++) diff |= computed[i] ^ tag[i];
+  if (diff != 0) { *err = "tag mismatch"; Storage.remove(kTmpPath); return false; }
+
+  Storage.remove(kSleepBmpPath);
+  if (!Storage.rename(kTmpPath, kSleepBmpPath)) { *err = "rename"; Storage.remove(kTmpPath); return false; }
+  return true;
 }
 }  // namespace
 
@@ -66,9 +121,7 @@ void DashboardSyncActivity::step(const char* msg) {
   requestUpdateAndWait();
 }
 
-void DashboardSyncActivity::writeLog() const {
-  Storage.writeFile(kLogPath, String(logBuf.c_str()));
-}
+void DashboardSyncActivity::writeLog() const { Storage.writeFile(kLogPath, String(logBuf.c_str())); }
 
 void DashboardSyncActivity::fail(const char* msg) {
   LOG_ERR("FRIDGE", "FAILED: %s", msg);
@@ -85,36 +138,28 @@ void DashboardSyncActivity::fail(const char* msg) {
 }
 
 void DashboardSyncActivity::doSync() {
-  const SyncConfig cfg = loadConfig();
-
-  step("Fetching pointer (GitHub)...");
-  std::string endpointJson;
-  if (!HttpDownloader::fetchUrl(cfg.endpoint, endpointJson)) {
-    return fail("Pointer fetch failed (offline?)");
-  }
-
-  JsonDocument doc;
-  if (deserializeJson(doc, endpointJson.c_str())) {
-    return fail("Bad pointer JSON");
-  }
-  const char* image = doc["image"] | "";
-  if (!image || image[0] == '\0') {
-    return fail("No image URL in pointer");
-  }
-  logBuf += "server: ";
-  logBuf += image;
-  logBuf += "\n";
+  step("Loading key (/fridge.conf)...");
+  uint8_t key[32];
+  if (!loadKey(key)) return fail("No key in /fridge.conf");
 
   step("Downloading dashboard...");
-  const std::string imageUrl = withToken(image, cfg.token);
-  const HttpDownloader::DownloadError err = HttpDownloader::downloadToFile(imageUrl, kSleepBmpPath);
-  if (err != HttpDownloader::OK) {
-    return fail("Download failed (server off?)");
+  Storage.remove(kEncPath);
+  if (HttpDownloader::downloadToFile(kEncUrl, kEncPath) != HttpDownloader::OK) {
+    return fail("Download failed (offline?)");
+  }
+
+  step("Decrypting...");
+  const char* err = "?";
+  if (!decryptEncToBmp(key, &err)) {
+    logBuf += err;
+    logBuf += "\n";
+    return fail(err);
   }
 
   step("Setting sleep cover...");
   SETTINGS.sleepScreen = CrossPointSettings::CUSTOM;
   SETTINGS.saveToFile();
+  Storage.remove(kEncPath);  // drop ciphertext, keep only /sleep.bmp
 
   logBuf += "OK\n";
   writeLog();
@@ -148,7 +193,6 @@ void DashboardSyncActivity::onEnter() {
 
 void DashboardSyncActivity::onExit() {
   Activity::onExit();
-  // Turn off wifi (mirrors OtaUpdateActivity).
   WiFi.disconnect(false);
   delay(100);
   WiFi.mode(WIFI_OFF);
