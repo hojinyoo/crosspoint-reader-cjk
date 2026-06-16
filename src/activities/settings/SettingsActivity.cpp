@@ -14,6 +14,7 @@
 #include "LanguageSelectActivity.h"
 #include "LineSpacingSelectionActivity.h"
 #include "MappedInputManager.h"
+#include "DashboardSyncActivity.h"
 #include "OtaUpdateActivity.h"
 #include "SdFirmwareUpdateActivity.h"
 #include "SettingsList.h"
@@ -53,6 +54,7 @@ void SettingsActivity::onEnter() {
   // Append device-only ACTION items
   controlsSettings.insert(controlsSettings.begin(),
                           SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_SYNC_DASHBOARD, SettingAction::SyncDashboard));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_BROWSER, SettingAction::OPDSBrowser));
@@ -266,6 +268,10 @@ void SettingsActivity::toggleCurrentSetting() {
         break;
       case SettingAction::CheckForCustomUpdates:
         startActivityForResult(std::make_unique<OtaUpdateActivity>(renderer, mappedInput, /*customMode=*/true),
+                               [this](const ActivityResult&) { requestUpdate(); });
+        break;
+      case SettingAction::SyncDashboard:
+        startActivityForResult(std::make_unique<DashboardSyncActivity>(renderer, mappedInput),
                                [this](const ActivityResult&) { requestUpdate(); });
         break;
       case SettingAction::InstallFirmwareFromSd:

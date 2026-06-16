@@ -21,6 +21,7 @@ enum class SettingAction {
   ClearCache,
   CheckForUpdates,
   CheckForCustomUpdates,
+  SyncDashboard,
   InstallFirmwareFromSd,
   Language,
   SelectUiFont,
