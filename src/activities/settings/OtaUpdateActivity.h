@@ -34,6 +34,7 @@ class OtaUpdateActivity : public Activity {
   bool lowMemoryOtaProgress = false;
   bool otaProgressGlyphAtlasReady = false;
   OtaProgressGlyph otaProgressGlyphs[OTA_PROGRESS_GLYPH_COUNT];
+  const bool customMode;
   OtaUpdater updater;
 
   void onWifiSelectionComplete(bool success);
@@ -43,8 +44,8 @@ class OtaUpdateActivity : public Activity {
   void renderOtaProgressOnly(unsigned int percentage, size_t processedSize, size_t totalSize);
 
  public:
-  explicit OtaUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-      : Activity("OtaUpdate", renderer, mappedInput), updater() {}
+  explicit OtaUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool customMode = false)
+      : Activity("OtaUpdate", renderer, mappedInput), customMode(customMode), updater(customMode) {}
   void onEnter() override;
   void onExit() override;
   void loop() override;

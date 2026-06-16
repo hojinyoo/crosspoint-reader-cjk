@@ -42,7 +42,9 @@ void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
     return;
   }
 
-  if (!updater.isUpdateNewer()) {
+  // Custom (fork) channel offers whatever the release host publishes; only the
+  // stock channel suppresses the prompt when the release isn't semver-newer.
+  if (!customMode && !updater.isUpdateNewer()) {
     LOG_DBG("OTA", "No new update available");
     {
       RenderLock lock;

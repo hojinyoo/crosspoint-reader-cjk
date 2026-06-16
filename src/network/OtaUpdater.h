@@ -4,6 +4,7 @@
 #include <string>
 
 class OtaUpdater {
+  bool customMode = false;
   bool updateAvailable = false;
   std::string latestVersion;
   std::string otaUrl;
@@ -30,7 +31,9 @@ class OtaUpdater {
 
   size_t getTotalSize() const { return totalSize; }
 
-  OtaUpdater() = default;
+  // customMode: check the user's own release host (see customReleaseUrl) and
+  // install whatever firmware.bin it publishes regardless of version.
+  explicit OtaUpdater(bool customMode = false) : customMode(customMode) {}
   bool isUpdateNewer() const;
   const std::string& getLatestVersion() const;
   OtaUpdaterError checkForUpdate();

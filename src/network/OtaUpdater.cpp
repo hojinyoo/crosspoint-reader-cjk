@@ -11,6 +11,9 @@
 
 namespace {
 constexpr char latestReleaseUrl[] = "https://api.github.com/repos/aBER0724/crosspoint-reader-cjk/releases/latest";
+// Custom update channel: the user's own release host. Its latest release must
+// attach an asset literally named "firmware.bin".
+constexpr char customReleaseUrl[] = "https://api.github.com/repos/hojinyoo/crosspoint-reader/releases/latest";
 
 /* This is buffer and size holder to keep upcoming data from latestReleaseUrl */
 char* local_buf;
@@ -125,7 +128,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   totalSize = 0;
 
   esp_http_client_config_t client_config = {
-      .url = latestReleaseUrl,
+      .url = customMode ? customReleaseUrl : latestReleaseUrl,
       .event_handler = event_handler,
       /* Default HTTP client buffer size 512 byte only */
       .buffer_size = 4096,
@@ -261,7 +264,7 @@ bool OtaUpdater::isUpdateNewer() const {
 const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; }
 
 OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgress, void* ctx) {
-  if (!isUpdateNewer()) {
+  if (!customMode && !isUpdateNewer()) {
     return UPDATE_OLDER_ERROR;
   }
 

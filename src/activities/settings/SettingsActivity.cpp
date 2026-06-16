@@ -58,6 +58,7 @@ void SettingsActivity::onEnter() {
   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_BROWSER, SettingAction::OPDSBrowser));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_CUSTOM_UPDATES, SettingAction::CheckForCustomUpdates));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_INSTALL_FIRMWARE_SD, SettingAction::InstallFirmwareFromSd));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
   readerSettings.push_back(SettingInfo::Action(StrId::STR_CUSTOMISE_STATUS_BAR, SettingAction::CustomiseStatusBar));
@@ -261,6 +262,10 @@ void SettingsActivity::toggleCurrentSetting() {
         break;
       case SettingAction::CheckForUpdates:
         startActivityForResult(std::make_unique<OtaUpdateActivity>(renderer, mappedInput),
+                               [this](const ActivityResult&) { requestUpdate(); });
+        break;
+      case SettingAction::CheckForCustomUpdates:
+        startActivityForResult(std::make_unique<OtaUpdateActivity>(renderer, mappedInput, /*customMode=*/true),
                                [this](const ActivityResult&) { requestUpdate(); });
         break;
       case SettingAction::InstallFirmwareFromSd:
