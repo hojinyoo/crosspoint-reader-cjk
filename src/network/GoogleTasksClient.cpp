@@ -12,13 +12,12 @@
 namespace {
 constexpr char kConfigPath[] = "/fridge.conf";
 constexpr char kTokenUrl[] = "https://oauth2.googleapis.com/token";
-// @default list, include completed so we can show check state; cap results.
-// fields mask trims the reply to just what we render, keeping the buffered
-// (de-chunked) body small on the ESP32-C3.
-constexpr char kTasksUrl[] =
-    "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks"
-    "?showCompleted=true&maxResults=20&fields=items(id,title,status)";
-constexpr char kTaskBaseUrl[] = "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks/";
+// All of the user's task lists; fields mask trims the reply.
+constexpr char kTaskListsUrl[] =
+    "https://tasks.googleapis.com/tasks/v1/users/@me/lists?fields=items(id,title)";
+// Per-list task-list and task URLs are built at runtime from the url-encoded list
+// id (see fetchTasksOnce / patchTaskOnce). include completed so we can show check
+// state; the fields mask keeps each (de-chunked) body small on the ESP32-C3.
 
 // Refresh slightly before the real expiry to avoid racing the clock.
 constexpr uint32_t kTokenSkewMs = 30 * 1000;
@@ -133,12 +132,70 @@ GoogleTasksClient::Result GoogleTasksClient::ensureToken(bool force) {
   return refreshToken();
 }
 
-GoogleTasksClient::Result GoogleTasksClient::fetchTasksOnce(std::vector<Task>& out, bool& outAuthExpired) {
+GoogleTasksClient::Result GoogleTasksClient::fetchListsOnce(std::vector<TaskList>& out, bool& outAuthExpired) {
   outAuthExpired = false;
   NetworkClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, kTasksUrl)) {
+  if (!http.begin(client, kTaskListsUrl)) {
+    lastError_ = "lists begin failed";
+    return Result::HTTP_ERROR;
+  }
+  http.addHeader("Authorization", String("Bearer ") + accessToken_.c_str());
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    LOG_ERR("GTASK", "lists HTTP %d", code);
+    http.end();
+    if (code == HTTP_CODE_UNAUTHORIZED) {
+      outAuthExpired = true;
+      lastError_ = "Token expired";
+      return Result::AUTH_FAILED;
+    }
+    if (code == HTTP_CODE_FORBIDDEN) {
+      lastError_ = "Re-consent needed";
+      return Result::PERMISSION;
+    }
+    lastError_ = "Lists GET failed";
+    return Result::HTTP_ERROR;
+  }
+
+  // Same chunked-response handling as fetchTasksOnce: getString() de-chunks; the
+  // fields mask keeps the body tiny.
+  const String body = http.getString();
+  http.end();
+
+  JsonDocument filter;
+  JsonObject item = filter["items"].add<JsonObject>();
+  item["id"] = true;
+  item["title"] = true;
+
+  JsonDocument d;
+  const DeserializationError err = deserializeJson(d, body, DeserializationOption::Filter(filter));
+  if (err) {
+    LOG_ERR("GTASK", "lists JSON: %s", err.c_str());
+    lastError_ = "Bad lists JSON";
+    return Result::PARSE_ERROR;
+  }
+
+  out.clear();
+  for (JsonObject l : d["items"].as<JsonArray>()) {
+    TaskList tl;
+    tl.id = static_cast<const char*>(l["id"] | "");
+    tl.title = static_cast<const char*>(l["title"] | "");
+    if (!tl.id.empty()) out.push_back(tl);
+  }
+  return Result::OK;
+}
+
+GoogleTasksClient::Result GoogleTasksClient::fetchTasksOnce(const std::string& listId, std::vector<Task>& out,
+                                                            bool& outAuthExpired) {
+  outAuthExpired = false;
+  NetworkClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  const String url = "https://tasks.googleapis.com/tasks/v1/lists/" + urlEncode(listId) +
+                     "/tasks?showCompleted=true&maxResults=20&fields=items(id,title,status)";
+  if (!http.begin(client, url)) {
     lastError_ = "tasks begin failed";
     return Result::HTTP_ERROR;
   }
@@ -190,19 +247,22 @@ GoogleTasksClient::Result GoogleTasksClient::fetchTasksOnce(std::vector<Task>& o
     Task task;
     task.id = static_cast<const char*>(t["id"] | "");
     task.title = static_cast<const char*>(t["title"] | "");
+    task.listId = listId;
     task.done = String(static_cast<const char*>(t["status"] | "")) == "completed";
     if (!task.title.empty()) out.push_back(task);
   }
   return Result::OK;
 }
 
-GoogleTasksClient::Result GoogleTasksClient::patchTaskOnce(const std::string& taskId, bool done,
-                                                           bool& outAuthExpired) {
+GoogleTasksClient::Result GoogleTasksClient::patchTaskOnce(const std::string& listId, const std::string& taskId,
+                                                           bool done, bool& outAuthExpired) {
   outAuthExpired = false;
   NetworkClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  const String url = String(kTaskBaseUrl) + urlEncode(taskId);
+  const String url =
+      "https://tasks.googleapis.com/tasks/v1/lists/" + urlEncode(listId) + "/tasks/" + urlEncode(taskId);
+  LOG_DBG("GTASK", "PATCH %s", url.c_str());
   if (!http.begin(client, url)) {
     lastError_ = "patch begin failed";
     return Result::HTTP_ERROR;
@@ -233,38 +293,52 @@ GoogleTasksClient::Result GoogleTasksClient::patchTaskOnce(const std::string& ta
   return Result::HTTP_ERROR;
 }
 
-GoogleTasksClient::Result GoogleTasksClient::listTasks(std::vector<Task>& out) {
+GoogleTasksClient::Result GoogleTasksClient::listTaskLists(std::vector<TaskList>& out) {
   Result tr = ensureToken(false);
   if (tr != Result::OK) return tr;
 
   bool authExpired = false;
-  Result r = fetchTasksOnce(out, authExpired);
+  Result r = fetchListsOnce(out, authExpired);
   if (r == Result::OK) return r;
   if (!authExpired) return r;  // 403/parse/http — do not retry
 
   // 401: discard token, force one refresh, retry once.
   tr = ensureToken(true);
   if (tr != Result::OK) return tr;
-  r = fetchTasksOnce(out, authExpired);
-  return r;
+  return fetchListsOnce(out, authExpired);
 }
 
-GoogleTasksClient::Result GoogleTasksClient::setTaskDone(const std::string& taskId, bool done) {
-  if (taskId.empty()) {
-    lastError_ = "Missing task id";
+GoogleTasksClient::Result GoogleTasksClient::listTasks(const std::string& listId, std::vector<Task>& out) {
+  Result tr = ensureToken(false);
+  if (tr != Result::OK) return tr;
+
+  bool authExpired = false;
+  Result r = fetchTasksOnce(listId, out, authExpired);
+  if (r == Result::OK) return r;
+  if (!authExpired) return r;  // 403/parse/http — do not retry
+
+  // 401: discard token, force one refresh, retry once.
+  tr = ensureToken(true);
+  if (tr != Result::OK) return tr;
+  return fetchTasksOnce(listId, out, authExpired);
+}
+
+GoogleTasksClient::Result GoogleTasksClient::setTaskDone(const std::string& listId, const std::string& taskId,
+                                                         bool done) {
+  if (listId.empty() || taskId.empty()) {
+    lastError_ = "Missing list/task id";
     return Result::HTTP_ERROR;
   }
   Result tr = ensureToken(false);
   if (tr != Result::OK) return tr;
 
   bool authExpired = false;
-  Result r = patchTaskOnce(taskId, done, authExpired);
+  Result r = patchTaskOnce(listId, taskId, done, authExpired);
   if (r == Result::OK) return r;
   if (!authExpired) return r;  // 403/http — do not retry
 
   // 401: discard token, force one refresh, retry once.
   tr = ensureToken(true);
   if (tr != Result::OK) return tr;
-  r = patchTaskOnce(taskId, done, authExpired);
-  return r;
+  return patchTaskOnce(listId, taskId, done, authExpired);
 }

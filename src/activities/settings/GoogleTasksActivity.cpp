@@ -51,22 +51,98 @@ static const char* messageForResult(GoogleTasksClient::Result r) {
 
 void GoogleTasksActivity::doFetch() {
   step("Fetching tasks...");
-  std::vector<Task> fetched;
-  const GoogleTasksClient::Result r = client.listTasks(fetched);
-  if (r != GoogleTasksClient::Result::OK) {
-    return fail(messageForResult(r));
+
+  std::vector<TaskList> lists;
+  const GoogleTasksClient::Result lr = client.listTaskLists(lists);
+  if (lr != GoogleTasksClient::Result::OK) {
+    return fail(messageForResult(lr));  // can't even enumerate lists -> global failure
   }
+
+  // Aggregate every list's tasks. A per-list TRANSIENT error skips that list and
+  // keeps going (partial results beat a total lockout); an account-wide error
+  // (auth / permission / no-creds) aborts. Cap the total to bound memory.
+  std::vector<Task> aggregated;
+  std::vector<TaskList> kept;  // lists that contributed >=1 task, in order
+  int failed = 0;
+  bool capped = false;
+  for (const TaskList& l : lists) {
+    if (static_cast<int>(aggregated.size()) >= kMaxTotalTasks) {
+      capped = true;
+      break;
+    }
+    std::vector<Task> tmp;
+    const GoogleTasksClient::Result r = client.listTasks(l.id, tmp);
+    if (r != GoogleTasksClient::Result::OK) {
+      if (r == GoogleTasksClient::Result::AUTH_FAILED || r == GoogleTasksClient::Result::NO_CREDS ||
+          r == GoogleTasksClient::Result::PERMISSION) {
+        return fail(messageForResult(r));  // account-wide -> abort the whole view
+      }
+      LOG_ERR("GTASK", "list '%s' failed: %s", l.title.c_str(), client.lastError().c_str());
+      failed++;
+      continue;  // transient -> skip this list, keep the rest
+    }
+    if (tmp.empty()) continue;  // drop lists with no titled tasks
+    LOG_INF("GTASK", "list '%s': %u task(s)", l.title.c_str(), static_cast<unsigned>(tmp.size()));
+    kept.push_back(l);
+    for (Task& t : tmp) {
+      if (static_cast<int>(aggregated.size()) >= kMaxTotalTasks) {
+        capped = true;
+        break;
+      }
+      aggregated.push_back(std::move(t));
+    }
+  }
+  if (capped) LOG_INF("GTASK", "task list truncated at %d", kMaxTotalTasks);
 
   {
     RenderLock lock;
-    tasks = std::move(fetched);
-    state = SHOW;
+    tasks = std::move(aggregated);
+    listsForHeaders = std::move(kept);
+    failedLists = failed;
     fetchedOk = true;
-    if (selectedIndex >= static_cast<int>(tasks.size())) {
-      selectedIndex = tasks.empty() ? 0 : static_cast<int>(tasks.size()) - 1;
-    }
+    rebuildRows();  // builds `rows` and seats selectedIndex on the first task row
+    state = SHOW;
   }
   requestUpdate();
+}
+
+// Rebuild the rendered row model from `tasks`, grouped under one header per list
+// (using listsForHeaders for titles + order). Seats selectedIndex on the first
+// task row so the cursor never starts on a header.
+void GoogleTasksActivity::rebuildRows() {
+  rows.clear();
+  for (const TaskList& l : listsForHeaders) {
+    bool headerEmitted = false;
+    for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
+      if (tasks[i].listId != l.id) continue;
+      if (!headerEmitted) {
+        Row h;
+        h.isHeader = true;
+        h.headerText = l.title;
+        rows.push_back(std::move(h));
+        headerEmitted = true;
+      }
+      Row r;
+      r.taskIndex = i;
+      rows.push_back(std::move(r));
+    }
+  }
+  // Surface partial results: if some lists errored but others loaded, prepend a
+  // non-selectable notice so the shorter list isn't silently misleading. Only
+  // when there is at least one task row (keeps tasks.empty() == rows.empty()).
+  if (!rows.empty() && failedLists > 0) {
+    Row warn;
+    warn.isHeader = true;
+    warn.headerText = "! " + std::to_string(failedLists) + " list(s) unavailable";
+    rows.insert(rows.begin(), std::move(warn));
+  }
+  selectedIndex = 0;
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    if (!rows[i].isHeader) {
+      selectedIndex = i;
+      break;
+    }
+  }
 }
 
 // Optimistically flip the selected row's done state, then PATCH it. On any
@@ -74,21 +150,27 @@ void GoogleTasksActivity::doFetch() {
 // error. Button presses are ignored while the write is in flight (debounce).
 void GoogleTasksActivity::toggleSelected() {
   if (writeInFlight) return;
-  if (selectedIndex < 0 || selectedIndex >= static_cast<int>(tasks.size())) return;
+  if (selectedIndex < 0 || selectedIndex >= static_cast<int>(rows.size())) return;
+  const Row& row = rows[selectedIndex];
+  if (row.isHeader) return;  // selection should never rest on a header; guard anyway
+  const int ti = row.taskIndex;
+  if (ti < 0 || ti >= static_cast<int>(tasks.size())) return;
 
-  const std::string taskId = tasks[selectedIndex].id;
-  const bool priorDone = tasks[selectedIndex].done;  // snapshot for revert
+  const std::string listId = tasks[ti].listId;
+  const std::string taskId = tasks[ti].id;
+  const bool priorDone = tasks[ti].done;  // snapshot for revert
   const bool newDone = !priorDone;
 
-  // Optimistic flip + lock out further presses, then redraw immediately.
+  // Optimistic flip + lock out further presses, then redraw immediately. The
+  // label callback reads tasks[ti].done live, so the row reflects the flip.
   {
     RenderLock lock;
-    tasks[selectedIndex].done = newDone;
+    tasks[ti].done = newDone;
     writeInFlight = true;
   }
   requestUpdateAndWait();
 
-  const GoogleTasksClient::Result r = client.setTaskDone(taskId, newDone);
+  const GoogleTasksClient::Result r = client.setTaskDone(listId, taskId, newDone);
 
   if (r == GoogleTasksClient::Result::OK) {
     RenderLock lock;
@@ -101,11 +183,9 @@ void GoogleTasksActivity::toggleSelected() {
   LOG_ERR("GTASK", "setTaskDone failed: %s", client.lastError().c_str());
   {
     RenderLock lock;
-    // Revert only if the row still refers to the same task (list is stable
-    // here — no refetch happens during an in-flight write).
-    if (selectedIndex >= 0 && selectedIndex < static_cast<int>(tasks.size()) &&
-        tasks[selectedIndex].id == taskId) {
-      tasks[selectedIndex].done = priorDone;
+    // List is stable during an in-flight write (no refetch), so index/id still match.
+    if (ti < static_cast<int>(tasks.size()) && tasks[ti].id == taskId) {
+      tasks[ti].done = priorDone;
     }
     statusMsg = messageForResult(r);
     state = FAILED;
@@ -169,7 +249,8 @@ void GoogleTasksActivity::render(RenderLock&&) {
     return;
   }
 
-  // state == SHOW
+  // state == SHOW. tasks.empty() == rows.empty() by construction — a list header
+  // (and the partial-results notice) is only emitted alongside >=1 task row.
   if (tasks.empty()) {
     // fetchedOk distinguishes a genuinely empty list from a soft state.
     renderer.drawCenteredText(UI_10_FONT_ID, (pageHeight - lineH) / 2, fetchedOk ? "No tasks" : "No tasks to show");
@@ -186,8 +267,13 @@ void GoogleTasksActivity::render(RenderLock&&) {
   // drawList() truncates each row title with renderer.truncatedText, draws the
   // selection highlight, and pages the scroll window by selectedIndex. Korean
   // titles render via drawText's external-UI-font fallback.
-  GUI.drawList(renderer, contentRect, static_cast<int>(tasks.size()), selectedIndex, [this](int index) {
-    const auto& t = tasks[index];
+  // Rows are list headers + task rows. Header rows render their list title;
+  // selection never lands on them (see loop()). Task rows read the LIVE task
+  // done-state so an optimistic check-off / revert shows without a row rebuild.
+  GUI.drawList(renderer, contentRect, static_cast<int>(rows.size()), selectedIndex, [this](int index) {
+    const Row& row = rows[index];
+    if (row.isHeader) return row.headerText;
+    const Task& t = tasks[row.taskIndex];
     return std::string(t.done ? "[x] " : "[ ] ") + t.title;
   });
 
@@ -228,6 +314,8 @@ void GoogleTasksActivity::loop() {
     client.invalidateToken();
     {
       RenderLock lock;
+      rows.clear();  // drop the stale model before re-fetching (selectedIndex re-seated in doFetch)
+      selectedIndex = 0;
       state = FETCHING;
     }
     requestUpdateAndWait();
@@ -235,16 +323,24 @@ void GoogleTasksActivity::loop() {
     return;
   }
 
-  if (tasks.empty()) return;
+  if (rows.empty()) return;
 
-  const int count = static_cast<int>(tasks.size());
+  // Move, then skip any header rows in the same direction. The `!= startIdx`
+  // guard bounds the loop so a degenerate all-header model can never spin forever.
+  const int rowCount = static_cast<int>(rows.size());
   if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
     RenderLock lock;
-    selectedIndex = ButtonNavigator::nextIndex(selectedIndex, count);
+    const int startIdx = selectedIndex;
+    do {
+      selectedIndex = ButtonNavigator::nextIndex(selectedIndex, rowCount);
+    } while (rows[selectedIndex].isHeader && selectedIndex != startIdx);
     requestUpdate();
   } else if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
     RenderLock lock;
-    selectedIndex = ButtonNavigator::previousIndex(selectedIndex, count);
+    const int startIdx = selectedIndex;
+    do {
+      selectedIndex = ButtonNavigator::previousIndex(selectedIndex, rowCount);
+    } while (rows[selectedIndex].isHeader && selectedIndex != startIdx);
     requestUpdate();
   } else if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     toggleSelected();

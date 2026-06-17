@@ -13,16 +13,23 @@
 // exchanges it for a short-lived access token (plain HTTPS POST — no JWT/RSA,
 // no heavy OAuth library) and then calls the Tasks REST API over HTTPS.
 //
-// Memory: the tasks list is parsed with a streaming ArduinoJson filter over the
-// HTTP body stream (not getString()), so the full ~KB response is never held in
-// heap on a ~400KB-RAM part. Results are capped at kMaxTasks.
+// Memory: each list reply is de-chunked via getString() then parsed with an
+// ArduinoJson field filter; a fields mask + maxResults keep the body to ~1-2 KB
+// on a ~400KB-RAM part. Per-list results are capped at kMaxTasks.
 class GoogleTasksClient {
  public:
   // A single Google Task. `id` is required by the write path (PATCH targets it).
   struct Task {
     std::string id;
     std::string title;
+    std::string listId;  // the task list this task belongs to (for the check-off URL)
     bool done = false;
+  };
+
+  // A Google task list (a named collection of tasks).
+  struct TaskList {
+    std::string id;
+    std::string title;
   };
 
   // Distinguishes failures so callers can render the right state.
@@ -39,15 +46,19 @@ class GoogleTasksClient {
 
   GoogleTasksClient() = default;
 
-  // Read the @default task list into `out` (cleared first). Refreshes the
-  // access token if no fresh one is cached. On 401, discards the cached token,
-  // forces one refresh, and retries once.
-  Result listTasks(std::vector<Task>& out);
+  // Read all of the user's task lists into `out` (cleared first). Same token
+  // refresh + one-shot 401 retry behavior as listTasks().
+  Result listTaskLists(std::vector<TaskList>& out);
 
-  // Mark a task complete (done=true) or needsAction (done=false) via PATCH.
-  // Success = HTTP 200 || 204. 403 maps to PERMISSION (no retry); 401 routes
-  // through the refresh+retry path.
-  Result setTaskDone(const std::string& taskId, bool done);
+  // Read one list's tasks into `out` (cleared first; each Task is stamped with
+  // `listId`). Refreshes the access token if none is cached; on 401, discards
+  // the cached token, forces one refresh, and retries once.
+  Result listTasks(const std::string& listId, std::vector<Task>& out);
+
+  // Mark a task complete (done=true) or needsAction (done=false) via PATCH on
+  // its own list. Success = HTTP 200 || 204. 403 maps to PERMISSION (no retry);
+  // 401 routes through the refresh+retry path.
+  Result setTaskDone(const std::string& listId, const std::string& taskId, bool done);
 
   // Drop any cached access token (e.g. after /fridge.conf changes).
   void invalidateToken();
@@ -67,13 +78,17 @@ class GoogleTasksClient {
   // POST to the token endpoint; on success caches access_token + expiry.
   Result refreshToken();
 
-  // One GET of the tasks list with the current cached token. `outAuthExpired`
-  // is set true on HTTP 401 so the caller can run the refresh+retry path.
-  Result fetchTasksOnce(std::vector<Task>& out, bool& outAuthExpired);
+  // One GET of the user's task lists with the current cached token.
+  // `outAuthExpired` is set true on HTTP 401 for the refresh+retry path.
+  Result fetchListsOnce(std::vector<TaskList>& out, bool& outAuthExpired);
 
-  // One PATCH of a task's status with the current cached token. `outAuthExpired`
-  // is set true on HTTP 401.
-  Result patchTaskOnce(const std::string& taskId, bool done, bool& outAuthExpired);
+  // One GET of `listId`'s tasks with the current cached token. `outAuthExpired`
+  // is set true on HTTP 401 so the caller can run the refresh+retry path.
+  Result fetchTasksOnce(const std::string& listId, std::vector<Task>& out, bool& outAuthExpired);
+
+  // One PATCH of a task's status (on `listId`) with the current cached token.
+  // `outAuthExpired` is set true on HTTP 401.
+  Result patchTaskOnce(const std::string& listId, const std::string& taskId, bool done, bool& outAuthExpired);
 
   bool credsLoaded_ = false;
   std::string clientId_;
