@@ -56,7 +56,7 @@ void SettingsActivity::onEnter() {
   controlsSettings.insert(controlsSettings.begin(),
                           SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_SYNC_DASHBOARD, SettingAction::SyncDashboard));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_GOOGLE_TASKS, SettingAction::GoogleTasks));
+  // Google Tasks now lives on the home menu (see HomeActivity); not duplicated here.
   systemSettings.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_BROWSER, SettingAction::OPDSBrowser));
