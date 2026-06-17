@@ -13,8 +13,11 @@ namespace {
 constexpr char kConfigPath[] = "/fridge.conf";
 constexpr char kTokenUrl[] = "https://oauth2.googleapis.com/token";
 // @default list, include completed so we can show check state; cap results.
+// fields mask trims the reply to just what we render, keeping the buffered
+// (de-chunked) body small on the ESP32-C3.
 constexpr char kTasksUrl[] =
-    "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?showCompleted=true&maxResults=20";
+    "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks"
+    "?showCompleted=true&maxResults=20&fields=items(id,title,status)";
 constexpr char kTaskBaseUrl[] = "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks/";
 
 // Refresh slightly before the real expiry to avoid racing the clock.
@@ -157,8 +160,16 @@ GoogleTasksClient::Result GoogleTasksClient::fetchTasksOnce(std::vector<Task>& o
     return Result::HTTP_ERROR;
   }
 
-  // Streaming filter parse: extract only items[].{id,title,status} straight from
-  // the body stream, so the whole response is never buffered in heap.
+  // The Tasks API replies with Transfer-Encoding: chunked. HTTPClient::getStream()
+  // hands back the RAW socket — chunk-size hex prefixes (e.g. "5f0\r\n{...") still
+  // inline — which ArduinoJson misreads as a bare number root: parsing "succeeds"
+  // with an empty document, so the list silently renders "No tasks". getString()
+  // de-chunks first (same path the token request already uses). The fields mask +
+  // maxResults keep the buffered body small enough for the ESP32-C3.
+  const String body = http.getString();
+  http.end();
+
+  // Filter keeps the parsed document tiny: only items[].{id,title,status} are kept.
   JsonDocument filter;
   JsonObject item = filter["items"].add<JsonObject>();
   item["id"] = true;
@@ -166,9 +177,7 @@ GoogleTasksClient::Result GoogleTasksClient::fetchTasksOnce(std::vector<Task>& o
   item["status"] = true;
 
   JsonDocument d;
-  const DeserializationError err =
-      deserializeJson(d, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
+  const DeserializationError err = deserializeJson(d, body, DeserializationOption::Filter(filter));
   if (err) {
     LOG_ERR("GTASK", "tasks JSON: %s", err.c_str());
     lastError_ = "Bad tasks JSON";
