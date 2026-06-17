@@ -22,6 +22,7 @@ enum class SettingAction {
   CheckForUpdates,
   CheckForCustomUpdates,
   SyncDashboard,
+  GoogleTasks,
   InstallFirmwareFromSd,
   Language,
   SelectUiFont,
