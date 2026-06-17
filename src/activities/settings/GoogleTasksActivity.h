@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "activities/Activity.h"
+#include "network/GoogleTasksClient.h"
 
 // Fetch the user's Google Tasks and show them on-device.
 //
@@ -16,26 +17,30 @@
 class GoogleTasksActivity : public Activity {
   enum State { WIFI_SELECTION, FETCHING, SHOW, FAILED };
 
-  struct Task {
-    std::string title;
-    bool done = false;
-  };
-
-  static constexpr int kMaxTasks = 20;
+  using Task = GoogleTasksClient::Task;
 
   State state = WIFI_SELECTION;
   std::string statusMsg;
   std::vector<Task> tasks;
+  GoogleTasksClient client;
+
+  // List navigation: index of the highlighted row. drawList() handles the
+  // scroll window (it pages by selectedIndex), so we only track the cursor.
+  int selectedIndex = 0;
+
+  // Distinguishes the empty-list state from a fetch/auth/permission failure so
+  // render() can show its own message (the list is empty in both cases).
+  bool fetchedOk = false;
+
+  // True while a check-off PATCH is in flight; ignore button presses until it
+  // resolves (debounce against a double-toggle).
+  bool writeInFlight = false;
 
   void onWifiSelectionComplete(bool success);
   void doFetch();
+  void toggleSelected();
   void step(const char* msg);
   void fail(const char* msg);
-
-  // Returns access token on success, empty on failure (sets statusMsg).
-  std::string refreshAccessToken(const std::string& clientId, const std::string& clientSecret,
-                                 const std::string& refreshToken);
-  bool fetchTasks(const std::string& accessToken);
 
  public:
   explicit GoogleTasksActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
@@ -44,6 +49,6 @@ class GoogleTasksActivity : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
-  bool preventAutoSleep() override { return state == FETCHING; }
+  bool preventAutoSleep() override { return state == FETCHING || writeInFlight; }
   bool skipLoopDelay() override { return true; }
 };
