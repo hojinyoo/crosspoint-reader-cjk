@@ -1,6 +1,8 @@
 #include "GoogleTasksActivity.h"
 
+#include <ArduinoJson.h>
 #include <GfxRenderer.h>
+#include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
@@ -10,6 +12,10 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/ButtonNavigator.h"
+
+namespace {
+constexpr char kCachePath[] = "/gtasks_cache.json";
+}  // namespace
 
 void GoogleTasksActivity::step(const char* msg) {
   LOG_INF("GTASK", "%s", msg);
@@ -99,10 +105,12 @@ void GoogleTasksActivity::doFetch() {
     tasks = std::move(aggregated);
     listsForHeaders = std::move(kept);
     failedLists = failed;
+    offline = false;
     fetchedOk = true;
     rebuildRows();  // builds `rows` and seats selectedIndex on the first task row
     state = SHOW;
   }
+  saveCache();  // persist for offline use (SD write while the render task is idle)
   requestUpdate();
 }
 
@@ -127,14 +135,22 @@ void GoogleTasksActivity::rebuildRows() {
       rows.push_back(std::move(r));
     }
   }
-  // Surface partial results: if some lists errored but others loaded, prepend a
-  // non-selectable notice so the shorter list isn't silently misleading. Only
-  // when there is at least one task row (keeps tasks.empty() == rows.empty()).
-  if (!rows.empty() && failedLists > 0) {
-    Row warn;
-    warn.isHeader = true;
-    warn.headerText = "! " + std::to_string(failedLists) + " list(s) unavailable";
-    rows.insert(rows.begin(), std::move(warn));
+  // Prepend a non-selectable status notice (offline cache, or partial results) so
+  // a stale/short list isn't silently misleading. Only when there is at least one
+  // task row (keeps tasks.empty() == rows.empty()).
+  if (!rows.empty()) {
+    std::string notice;
+    if (offline) {
+      notice = "! offline - showing saved tasks";
+    } else if (failedLists > 0) {
+      notice = "! " + std::to_string(failedLists) + " list(s) unavailable";
+    }
+    if (!notice.empty()) {
+      Row warn;
+      warn.isHeader = true;
+      warn.headerText = std::move(notice);
+      rows.insert(rows.begin(), std::move(warn));
+    }
   }
   selectedIndex = 0;
   for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
@@ -150,6 +166,7 @@ void GoogleTasksActivity::rebuildRows() {
 // error. Button presses are ignored while the write is in flight (debounce).
 void GoogleTasksActivity::toggleSelected() {
   if (writeInFlight) return;
+  if (offline) return;  // cannot check off without WiFi (showing cached tasks)
   if (selectedIndex < 0 || selectedIndex >= static_cast<int>(rows.size())) return;
   const Row& row = rows[selectedIndex];
   if (row.isHeader) return;  // selection should never rest on a header; guard anyway
@@ -196,25 +213,45 @@ void GoogleTasksActivity::toggleSelected() {
 }
 
 void GoogleTasksActivity::onWifiSelectionComplete(const bool success) {
-  if (!success) {
-    // WiFi join failed (or user cancelled the picker): surface a distinct
-    // offline state instead of silently finish()ing.
-    fail("WiFi join failed");
+  if (success) {
+    offline = false;
+    {
+      RenderLock lock;
+      state = FETCHING;
+    }
+    requestUpdateAndWait();
+    doFetch();  // fetch fresh + save the cache
     return;
   }
+
+  // No WiFi (auto-connect failed or the picker was cancelled): fall back to the
+  // last tasks saved on SD instead of failing. loadCache reads SD outside the
+  // render lock; the member swap happens under the lock.
+  offline = true;
+  std::vector<Task> cachedTasks;
+  std::vector<TaskList> cachedLists;
+  const bool haveCache = loadCache(cachedTasks, cachedLists);
   {
     RenderLock lock;
-    state = FETCHING;
+    if (haveCache) {
+      tasks = std::move(cachedTasks);
+      listsForHeaders = std::move(cachedLists);
+      failedLists = 0;
+      fetchedOk = true;
+      rebuildRows();
+      state = SHOW;
+    } else {
+      statusMsg = "No WiFi and no saved tasks";
+      fetchedOk = false;
+      state = FAILED;
+    }
   }
-  requestUpdateAndWait();
-  doFetch();
+  requestUpdate();
 }
 
 void GoogleTasksActivity::onEnter() {
   Activity::onEnter();
-  WiFi.mode(WIFI_STA);
-  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
-                         [this](const ActivityResult& result) { onWifiSelectionComplete(!result.isCancelled); });
+  startConnect();
 }
 
 void GoogleTasksActivity::onExit() {
@@ -234,7 +271,9 @@ void GoogleTasksActivity::render(RenderLock&&) {
 
   const auto lineH = renderer.getLineHeight(UI_10_FONT_ID);
 
-  if (state == FETCHING) {
+  if (state == FETCHING || state == WIFI_SELECTION) {
+    // WIFI_SELECTION: the WiFi picker child normally covers us, but guard against a
+    // transient frame falling through to the SHOW path and flashing "No tasks".
     renderer.drawCenteredText(UI_10_FONT_ID, (pageHeight - lineH) / 2, statusMsg.c_str());
     renderer.displayBuffer();
     return;
@@ -254,8 +293,8 @@ void GoogleTasksActivity::render(RenderLock&&) {
   if (tasks.empty()) {
     // fetchedOk distinguishes a genuinely empty list from a soft state.
     renderer.drawCenteredText(UI_10_FONT_ID, (pageHeight - lineH) / 2, fetchedOk ? "No tasks" : "No tasks to show");
-    // No rows to select; Left button still refreshes (see loop()).
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "Refresh", "");
+    // No rows to select; Confirm re-fetches.
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "Refresh", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();
     return;
@@ -277,10 +316,80 @@ void GoogleTasksActivity::render(RenderLock&&) {
     return std::string(t.done ? "[x] " : "[ ] ") + t.title;
   });
 
-  // Back / Select(check-off) / Up / Down. Left button = refresh (see loop()).
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+  // Back / Select(check-off) / Previous / Next (Up|Left and Down|Right both move).
+  // Offline (cached) view swaps Select for Refresh (reconnect) since check-off needs WiFi.
+  const auto labels = offline
+                          ? mappedInput.mapLabels(tr(STR_BACK), "Refresh", tr(STR_DIR_UP), tr(STR_DIR_DOWN))
+                          : mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
+}
+
+// (Re)attempt WiFi, then fetch when connected or fall back to the saved cache.
+// Used on entry and by the retry paths (empty + FAILED states).
+void GoogleTasksActivity::startConnect() {
+  WiFi.mode(WIFI_STA);
+  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
+                         [this](const ActivityResult& result) { onWifiSelectionComplete(!result.isCancelled); });
+}
+
+// Persist the aggregated tasks (grouped by list) to SD so they can be shown
+// offline next time. Small (capped + only id/title/done), so a String is fine.
+void GoogleTasksActivity::saveCache() const {
+  JsonDocument doc;
+  JsonArray jlists = doc["lists"].to<JsonArray>();
+  for (const TaskList& l : listsForHeaders) {
+    JsonObject jl = jlists.add<JsonObject>();
+    jl["id"] = l.id;
+    jl["title"] = l.title;
+    JsonArray jt = jl["tasks"].to<JsonArray>();
+    for (const Task& t : tasks) {
+      if (t.listId != l.id) continue;
+      JsonObject jo = jt.add<JsonObject>();
+      jo["id"] = t.id;
+      jo["title"] = t.title;
+      jo["done"] = t.done;
+    }
+  }
+  String out;
+  if (serializeJson(doc, out) == 0 || out.isEmpty()) {
+    LOG_ERR("GTASK", "cache serialize failed; keeping previous cache");
+    return;  // don't overwrite a good cache with a truncated/empty document
+  }
+  if (!Storage.writeFile(kCachePath, out)) {
+    LOG_ERR("GTASK", "cache write failed");
+  }
+}
+
+// Read the cached tasks into the given vectors (caller swaps them in under the
+// render lock). Returns true if at least one titled task was loaded.
+bool GoogleTasksActivity::loadCache(std::vector<Task>& outTasks, std::vector<TaskList>& outLists) const {
+  if (!Storage.exists(kCachePath)) return false;
+  const String j = Storage.readFile(kCachePath);
+  if (j.isEmpty()) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, j.c_str())) return false;
+  outTasks.clear();
+  outLists.clear();
+  for (JsonObject jl : doc["lists"].as<JsonArray>()) {
+    TaskList tl;
+    tl.id = static_cast<const char*>(jl["id"] | "");
+    tl.title = static_cast<const char*>(jl["title"] | "");
+    if (tl.id.empty()) continue;
+    bool any = false;
+    for (JsonObject jo : jl["tasks"].as<JsonArray>()) {
+      Task t;
+      t.id = static_cast<const char*>(jo["id"] | "");
+      t.title = static_cast<const char*>(jo["title"] | "");
+      t.listId = tl.id;
+      t.done = jo["done"] | false;
+      if (t.title.empty()) continue;
+      outTasks.push_back(std::move(t));
+      any = true;
+    }
+    if (any) outLists.push_back(std::move(tl));
+  }
+  return !outTasks.empty();
 }
 
 void GoogleTasksActivity::loop() {
@@ -294,48 +403,37 @@ void GoogleTasksActivity::loop() {
   }
 
   if (state == FAILED) {
-    // Confirm retries the fetch.
-    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-      {
-        RenderLock lock;
-        state = FETCHING;
-      }
-      requestUpdateAndWait();
-      doFetch();
-    }
+    // Confirm retries: re-attempt WiFi, then fetch (online) or load the cache.
+    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) startConnect();
     return;
   }
 
   if (state != SHOW) return;
 
-  // Refresh re-fetches the list (Left button is otherwise unused in a vertical
-  // Up/Down list). Also reload creds from /fridge.conf in case they changed.
-  if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
-    client.invalidateToken();
-    {
-      RenderLock lock;
-      rows.clear();  // drop the stale model before re-fetching (selectedIndex re-seated in doFetch)
-      selectedIndex = 0;
-      state = FETCHING;
-    }
-    requestUpdateAndWait();
-    doFetch();
+  if (rows.empty()) {
+    // Empty list: Confirm retries (re-attempts WiFi). Back exits (handled above).
+    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) startConnect();
     return;
   }
 
-  if (rows.empty()) return;
-
-  // Move, then skip any header rows in the same direction. The `!= startIdx`
-  // guard bounds the loop so a degenerate all-header model can never spin forever.
+  // Navigation matches the rest of the app's list screens: NEXT = Down OR Right,
+  // PREVIOUS = Up OR Left. The device maps the physical nav buttons to Left/Right
+  // (not Up/Down) in this orientation, so checking only Up/Down missed them.
+  // After moving, skip header rows in the same direction; the `!= startIdx` guard
+  // bounds the loop so a degenerate all-header model can never spin forever.
   const int rowCount = static_cast<int>(rows.size());
-  if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+  const bool goNext = mappedInput.wasPressed(MappedInputManager::Button::Down) ||
+                      mappedInput.wasPressed(MappedInputManager::Button::Right);
+  const bool goPrev = mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+                      mappedInput.wasPressed(MappedInputManager::Button::Left);
+  if (goNext) {
     RenderLock lock;
     const int startIdx = selectedIndex;
     do {
       selectedIndex = ButtonNavigator::nextIndex(selectedIndex, rowCount);
     } while (rows[selectedIndex].isHeader && selectedIndex != startIdx);
     requestUpdate();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
+  } else if (goPrev) {
     RenderLock lock;
     const int startIdx = selectedIndex;
     do {
@@ -343,6 +441,11 @@ void GoogleTasksActivity::loop() {
     } while (rows[selectedIndex].isHeader && selectedIndex != startIdx);
     requestUpdate();
   } else if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-    toggleSelected();
+    // Online: check off the selected task. Offline (cached view): reconnect/refresh.
+    if (offline) {
+      startConnect();
+    } else {
+      toggleSelected();
+    }
   }
 }

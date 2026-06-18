@@ -229,7 +229,7 @@ void HomeActivity::render(RenderLock&&) {
 
   std::vector<const char*> menuItems = {tr(STR_GOOGLE_TASKS), tr(STR_BROWSE_FILES), tr(STR_MENU_RECENT_BOOKS),
                                         tr(STR_FILE_TRANSFER), tr(STR_SETTINGS_TITLE)};
-  std::vector<UIIcon> menuIcons = {Text, Folder, Recent, Transfer, Settings};
+  std::vector<UIIcon> menuIcons = {Tasks, Folder, Recent, Transfer, Settings};
 
   if (hasOpdsUrl) {
     menuItems.insert(menuItems.begin() + 3, tr(STR_OPDS_BROWSER));

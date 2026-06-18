@@ -22,6 +22,7 @@
 #include "components/icons/image24.h"
 #include "components/icons/library.h"
 #include "components/icons/recent.h"
+#include "components/icons/tasks.h"
 #include "components/icons/settings2.h"
 #include "components/icons/text24.h"
 #include "components/icons/transfer.h"
@@ -93,6 +94,8 @@ const uint8_t* iconForName(UIIcon icon, int size) {
         return Settings2Icon;
       case UIIcon::Transfer:
         return TransferIcon;
+      case UIIcon::Tasks:
+        return TasksIcon;
       case UIIcon::Library:
         return LibraryIcon;
       case UIIcon::Wifi:

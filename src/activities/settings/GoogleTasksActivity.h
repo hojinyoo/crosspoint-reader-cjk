@@ -36,6 +36,7 @@ class GoogleTasksActivity : public Activity {
   std::vector<TaskList> listsForHeaders;   // lists that contributed >=1 task, in order
   std::vector<Row> rows;                   // header + task rows for render/navigation
   int failedLists = 0;                     // lists that errored during the last fetch
+  bool offline = false;                    // showing cached tasks (no WiFi); check-off disabled
   GoogleTasksClient client;
 
   // List navigation: index of the highlighted row. drawList() handles the
@@ -51,9 +52,13 @@ class GoogleTasksActivity : public Activity {
   bool writeInFlight = false;
 
   void onWifiSelectionComplete(bool success);
+  void startConnect();  // (re)attempt WiFi, then fetch (online) or load cache (offline)
   void doFetch();
   void rebuildRows();   // rebuild `rows` from `tasks` and re-seat selectedIndex
   void toggleSelected();
+  void saveCache() const;  // persist the aggregated tasks to SD for offline use
+  // Load the cached tasks into the given vectors (SD read, no lock). Returns true if >=1 task.
+  bool loadCache(std::vector<Task>& outTasks, std::vector<TaskList>& outLists) const;
   void step(const char* msg);
   void fail(const char* msg);
 
