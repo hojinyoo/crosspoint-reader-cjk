@@ -8,6 +8,7 @@ class OtaUpdater {
   bool updateAvailable = false;
   std::string latestVersion;
   std::string otaUrl;
+  std::string lastError_;
   size_t otaSize = 0;
   size_t processedSize = 0;
   size_t totalSize = 0;
@@ -30,6 +31,9 @@ class OtaUpdater {
   size_t getProcessedSize() const { return processedSize; }
 
   size_t getTotalSize() const { return totalSize; }
+
+  // Human-readable detail of the last failure (phase + esp_err), shown on the UI.
+  const std::string& lastError() const { return lastError_; }
 
   // customMode: check the user's own release host (see customReleaseUrl) and
   // install whatever firmware.bin it publishes regardless of version.
