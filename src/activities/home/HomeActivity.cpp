@@ -22,7 +22,7 @@
 #include "util/StringUtils.h"
 
 int HomeActivity::getMenuItemCount() const {
-  int count = 4;  // My Library, Recents, File transfer, Settings
+  int count = 5;  // Google Tasks, My Library, Recents, File transfer, Settings
   if (!recentBooks.empty()) {
     count += recentBooks.size();
   }
@@ -197,6 +197,7 @@ void HomeActivity::loop() {
     // Calculate dynamic indices based on which options are available
     int idx = 0;
     int menuSelectedIndex = selectorIndex - static_cast<int>(recentBooks.size());
+    const int googleTasksIdx = idx++;
     const int myLibraryIdx = idx++;
     const int recentsIdx = idx++;
     const int opdsLibraryIdx = hasOpdsUrl ? idx++ : -1;
@@ -205,6 +206,8 @@ void HomeActivity::loop() {
 
     if (selectorIndex < recentBooks.size()) {
       activityManager.goToReader(recentBooks[selectorIndex].path);
+    } else if (menuSelectedIndex == googleTasksIdx) {
+      activityManager.goToGoogleTasks();
     } else if (menuSelectedIndex == myLibraryIdx) {
       activityManager.goToFileBrowser();
     } else if (menuSelectedIndex == recentsIdx) {
@@ -224,13 +227,13 @@ void HomeActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
-  std::vector<const char*> menuItems = {tr(STR_BROWSE_FILES), tr(STR_MENU_RECENT_BOOKS), tr(STR_FILE_TRANSFER),
-                                        tr(STR_SETTINGS_TITLE)};
-  std::vector<UIIcon> menuIcons = {Folder, Recent, Transfer, Settings};
+  std::vector<const char*> menuItems = {tr(STR_GOOGLE_TASKS), tr(STR_BROWSE_FILES), tr(STR_MENU_RECENT_BOOKS),
+                                        tr(STR_FILE_TRANSFER), tr(STR_SETTINGS_TITLE)};
+  std::vector<UIIcon> menuIcons = {Tasks, Folder, Recent, Transfer, Settings};
 
   if (hasOpdsUrl) {
-    menuItems.insert(menuItems.begin() + 2, tr(STR_OPDS_BROWSER));
-    menuIcons.insert(menuIcons.begin() + 2, Library);
+    menuItems.insert(menuItems.begin() + 3, tr(STR_OPDS_BROWSER));
+    menuIcons.insert(menuIcons.begin() + 3, Library);
   }
 
   const auto hintInsets = GUI.getButtonHintInsets(renderer);

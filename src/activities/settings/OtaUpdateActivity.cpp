@@ -42,7 +42,9 @@ void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
     return;
   }
 
-  if (!updater.isUpdateNewer()) {
+  // Custom (fork) channel offers whatever the release host publishes; only the
+  // stock channel suppresses the prompt when the release isn't semver-newer.
+  if (!customMode && !updater.isUpdateNewer()) {
     LOG_DBG("OTA", "No new update available");
     {
       RenderLock lock;
@@ -278,6 +280,11 @@ void OtaUpdateActivity::render(RenderLock&&) {
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state == FAILED) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_FAILED), true, EpdFontFamily::BOLD);
+    // Show the specific failure (phase + esp_err) so the cause is diagnosable on-device.
+    const auto& detail = updater.lastError();
+    if (!detail.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, top + height + metrics.verticalSpacing, detail.c_str());
+    }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state == FINISHED) {
